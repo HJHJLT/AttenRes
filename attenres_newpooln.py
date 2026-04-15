@@ -16,6 +16,8 @@ class RFISet2D(Dataset):
     def __init__(self, root2d, split):
         self.img_dir = osp.join(root2d, f"{split}_npz")
         self.files = [f for f in os.listdir(self.img_dir) if f.endswith(".npz")] if osp.isdir(self.img_dir) else []
+        if len(self.files) == 0:
+            print(f"警告: 数据集目录 {self.img_dir} 为空或不存在，或者没有 .npz 文件！")
         
     def __len__(self):
         return len(self.files)
@@ -32,7 +34,6 @@ class RFISet2D(Dataset):
         im = im.astype(np.float32)
         lab = lab.astype(np.int64)
         
-        # Log1p + Z-score 鲁棒归一化
         im = np.log1p(im - np.min(im) if np.min(im) < 0 else im)
         im = (im - np.mean(im)) / (np.std(im) + 1e-8)
         
@@ -51,7 +52,6 @@ class RFISet2D(Dataset):
         y = torch.tensor(lab, dtype=torch.int64)
         return x, y, f
 
-# 引入条带池化的 SE Block (类似 Coordinate Attention)
 class StripSEBlock2D(nn.Module):
     def __init__(self, c, r=16):
         super().__init__()
@@ -66,20 +66,19 @@ class StripSEBlock2D(nn.Module):
         
     def forward(self, x):
         b, c, h, w = x.shape
-        x_h = self.pool_h(x) # B, C, H, 1
-        x_w = self.pool_w(x).permute(0, 1, 3, 2) # B, C, W, 1
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
         
-        y = torch.cat([x_h, x_w], dim=2) # B, C, H+W, 1
+        y = torch.cat([x_h, x_w], dim=2)
         y = self.act(self.conv(y))
         
         y_h, y_w = torch.split(y, [h, w], dim=2)
-        y_w = y_w.permute(0, 1, 3, 2) # B, C, 1, W
+        y_w = y_w.permute(0, 1, 3, 2)
         
         a_h = self.gate(self.conv_h(y_h))
         a_w = self.gate(self.conv_w(y_w))
         return x * a_h * a_w
 
-# 提取固定长度的条带几何特征作为 Summary
 class BlockSummary2D(nn.Module):
     def __init__(self, out_dim=256, in_channels_list=None, strip_len=8):
         super().__init__()
@@ -92,15 +91,13 @@ class BlockSummary2D(nn.Module):
         
     def forward(self, x):
         b, c, h, w = x.shape
-        # 将空间池化为固定的 strip_len 长度，以便跨层对齐
         s_h = F.adaptive_avg_pool2d(x, (self.strip_len, 1)).view(b, c * self.strip_len)
         s_w = F.adaptive_avg_pool2d(x, (1, self.strip_len)).view(b, c * self.strip_len)
         
-        strip_feat = torch.cat([s_h, s_w], dim=1) # [B, C * 2 * strip_len]
+        strip_feat = torch.cat([s_h, s_w], dim=1)
         summary = self.proj[str(c)](strip_feat)
-        return summary.view(b, -1, 1, 1) # 保持维度兼容 [B, 256, 1, 1]
+        return summary.view(b, -1, 1, 1)
 
-#  使用条带特征生成 Query
 class DepthAttn2D(nn.Module):
     def __init__(self, out_c, summary_dim=256, num_heads=4, block_size=8, strip_len=8):
         super().__init__()
@@ -112,7 +109,6 @@ class DepthAttn2D(nn.Module):
         self.block_size = block_size
         self.strip_len = strip_len
         
-        # Q 使用条带特征进行映射
         self.q_norm = nn.RMSNorm(out_c * 2 * strip_len)
         self.q_proj = nn.Linear(out_c * 2 * strip_len, summary_dim)
         
@@ -140,7 +136,6 @@ class DepthAttn2D(nn.Module):
         b, c, h, w = y.shape
         summaries = self.group_blocks(summaries)
         
-        # 提取 Query 的条带特征
         s_h = F.adaptive_avg_pool2d(y, (self.strip_len, 1)).view(b, c * self.strip_len)
         s_w = F.adaptive_avg_pool2d(y, (1, self.strip_len)).view(b, c * self.strip_len)
         q_feat = torch.cat([s_h, s_w], dim=1)
@@ -168,7 +163,6 @@ class DepthAttn2D(nn.Module):
         out = F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
         return out
 
-# 基于条带池化的空间十字交叉门控
 class GateFusion2D(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -184,20 +178,20 @@ class GateFusion2D(nn.Module):
         if attn is None:
             return y
         b, c, h, w = y.shape
-        cat_feat = torch.cat([y, attn], dim=1) # B, 2C, H, W
+        cat_feat = torch.cat([y, attn], dim=1)
         
-        pool_h = self.pool_h(cat_feat) # B, 2C, H, 1
-        pool_w = self.pool_w(cat_feat).permute(0, 1, 3, 2) # B, 2C, W, 1
+        pool_h = self.pool_h(cat_feat)
+        pool_w = self.pool_w(cat_feat).permute(0, 1, 3, 2)
         
-        pool_cat = torch.cat([pool_h, pool_w], dim=2) # B, 2C, H+W, 1
-        mid = self.act(self.fc1(pool_cat)) # B, C, H+W, 1
+        pool_cat = torch.cat([pool_h, pool_w], dim=2)
+        mid = self.act(self.fc1(pool_cat))
         
         mid_h, mid_w = torch.split(mid, [h, w], dim=2)
-        mid_w = mid_w.permute(0, 1, 3, 2) # B, C, 1, W
+        mid_w = mid_w.permute(0, 1, 3, 2)
         
         g_h = self.gate(self.fc2_h(mid_h))
         g_w = self.gate(self.fc2_w(mid_w))
-        g = g_h * g_w # 结合水平和垂直形成 [B, C, H, W] 的空间门控
+        g = g_h * g_w
         
         return y * (1 - g) + attn * g
 
@@ -346,7 +340,7 @@ def val_metrics(model, loader, device, w_cls, desc):
     f1 = (2 * prec * rec) / torch.clamp(prec + rec, min=1e-6)
     return dices.detach().cpu().numpy(), (ce_sum / max(n,1)), class_acc.detach().cpu().numpy(), overall_acc, prec.detach().cpu().numpy(), rec.detach().cpu().numpy(), f1.detach().cpu().numpy()
 
-def train(batch_size, lr, epochs, root2d, save_dir, num_workers, block_size=8):
+def train(batch_size, lr, epochs, root2d, save_dir, num_workers, block_size=8, base_c=32):
     torch.backends.cudnn.benchmark = True
     
     ds_tr = RFISet2D(root2d, "train")
@@ -357,7 +351,7 @@ def train(batch_size, lr, epochs, root2d, save_dir, num_workers, block_size=8):
     dl_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AttenResUNet(1, 64, block_size=block_size).to(device)
+    model = AttenResUNet(1, base_c, block_size=block_size).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     
     warmup_epochs = 5
@@ -368,7 +362,7 @@ def train(batch_size, lr, epochs, root2d, save_dir, num_workers, block_size=8):
     os.makedirs(save_dir, exist_ok=True)
     
     scaler = GradScaler()
-    best = -1.0; best_path = None
+    best_score = -1.0; best_path = None
     for ep in range(1, epochs+1):
         model.train()
         pbar = tqdm(dl_tr, desc=f"训练 Epoch {ep}/{epochs}", total=len(dl_tr))
@@ -400,30 +394,35 @@ def train(batch_size, lr, epochs, root2d, save_dir, num_workers, block_size=8):
             scheduler.step()
             
         val_dices, val_ce, val_class_acc, val_overall_acc, val_class_prec, val_class_rec, val_class_f1 = val_metrics(model, dl_va, device, w_cb, "验证集评估")
-        test_dices, test_ce, test_class_acc, test_overall_acc, test_class_prec, test_class_rec, test_class_f1 = val_metrics(model, dl_te, device, w_cb, "测试集评估")
         
         msg = "epoch {} | ".format(ep) \
               + " ".join(["val_prec_c{}:{:.4f}".format(i, val_class_prec[i]) for i in range(NUM_CLASSES)]) \
               + " " \
               + " ".join(["val_rec_c{}:{:.4f}".format(i, val_class_rec[i]) for i in range(NUM_CLASSES)]) \
               + " " \
-              + " ".join(["val_f1_c{}:{:.4f}".format(i, val_class_f1[i]) for i in range(NUM_CLASSES)]) \
-              + " | " \
-              + " ".join(["test_prec_c{}:{:.4f}".format(i, test_class_prec[i]) for i in range(NUM_CLASSES)]) \
-              + " " \
-              + " ".join(["test_rec_c{}:{:.4f}".format(i, test_class_rec[i]) for i in range(NUM_CLASSES)]) \
-              + " " \
-              + " ".join(["test_f1_c{}:{:.4f}".format(i, test_class_f1[i]) for i in range(NUM_CLASSES)])
+              + " ".join(["val_f1_c{}:{:.4f}".format(i, val_class_f1[i]) for i in range(NUM_CLASSES)])
         print(msg)
         with open(osp.join(save_dir, "train_log.txt"), "a", encoding="utf-8") as f:
             f.write(msg + "\n")
             
-        # 优化：剔除背景类(通常为索引0)，只根据 RFI 类别(索引1~5)的平均 F1 分数来评估和保存最佳模型
-        cur = float(np.mean(test_class_f1[1:]))
-        if cur > best:
-            best = cur
+        val_f1_mean = float(np.mean(val_class_f1[1:]))
+        
+        if val_f1_mean > best_score:
+            best_score = val_f1_mean
             best_path = osp.join(save_dir, f"attenres_newpool_best_epoch{ep}.pt")
             torch.save(model.state_dict(), best_path)
+            
+            test_dices, test_ce, test_class_acc, test_overall_acc, test_class_prec, test_class_rec, test_class_f1 = val_metrics(model, dl_te, device, w_cb, "测试集评估")
+            test_msg = "best updated -> epoch {} | val_f1_mean {:.4f} | ".format(ep, val_f1_mean) \
+                       + " ".join(["test_prec_c{}:{:.4f}".format(i, test_class_prec[i]) for i in range(NUM_CLASSES)]) \
+                       + " " \
+                       + " ".join(["test_rec_c{}:{:.4f}".format(i, test_class_rec[i]) for i in range(NUM_CLASSES)]) \
+                       + " " \
+                       + " ".join(["test_f1_c{}:{:.4f}".format(i, test_class_f1[i]) for i in range(NUM_CLASSES)])
+            print(test_msg)
+            with open(osp.join(save_dir, "train_log.txt"), "a", encoding="utf-8") as f:
+                f.write(test_msg + "\n")
+            
         if ep % 10 == 0:
             torch.save(model.state_dict(), osp.join(save_dir, f"attenres_newpool_epoch{ep}.pt"))
 
@@ -436,5 +435,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--block-size", type=int, default=8, help="Block size for DepthAttn2D group_blocks")
+    parser.add_argument("--base-c", type=int, default=32, help="Base channels")
     args = parser.parse_args()
-    train(args.batch_size, args.lr, args.epochs, args.root2d, args.save_dir, args.num_workers, args.block_size)
+    train(args.batch_size, args.lr, args.epochs, args.root2d, args.save_dir, args.num_workers, args.block_size, args.base_c)
